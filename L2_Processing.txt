@@ -1,0 +1,285 @@
+Your assumption is **correct**, and your question is exactly the *right* next one.
+
+> If **XDP_REDIRECT → AF_XDP** is used exclusively by a **userspace SCTP stack**, then **you must implement a *minimal but correct L2 shim*** in userspace.
+
+Not a full Ethernet stack — just what is *strictly required* for correctness, performance, and interoperability.
+
+Below is the **authoritative breakdown**.
+
+---
+
+## First: clarify the scope (important)
+
+You are **not** re-implementing Ethernet like a kernel does.
+
+Your design is:
+
+```
+NIC
+ → XDP (filter + redirect)
+ → AF_XDP (L2 frames)
+ → userspace SCTP stack
+```
+
+So:
+
+* Kernel **no longer processes L2/L3**
+* Your app becomes the **termination point** for Ethernet frames
+* But only for **traffic you redirect**
+
+This allows a **very lean L2 implementation**.
+
+---
+
+## What L2 responsibilities move to userspace?
+
+Only these four categories:
+
+1. **Frame validation & parsing**
+2. **VLAN handling**
+3. **Address resolution (ARP / NDP)**
+4. **Frame construction on TX**
+
+Everything else is *explicitly out of scope*.
+
+---
+
+## 1️⃣ Mandatory L2 RX processing (must-have)
+
+### a) Ethernet header parsing
+
+You must:
+
+* Parse `struct ethhdr`
+* Validate EtherType
+* Drop everything else early
+
+Required logic:
+
+```c
+eth = (struct ethhdr *)buf;
+
+if (eth->h_proto == htons(ETH_P_IP)) {
+    // IPv4
+} else if (eth->h_proto == htons(ETH_P_IPV6)) {
+    // IPv6
+} else if (eth->h_proto == htons(ETH_P_ARP)) {
+    // ARP (handle separately)
+} else {
+    drop;
+}
+```
+
+No negotiation, no fallback — **drop aggressively**.
+
+---
+
+### b) VLAN stripping (mandatory in real networks)
+
+You **must** handle VLAN tags, otherwise your stack will fail silently in production.
+
+Handle:
+
+* `0x8100` (802.1Q)
+* `0x88A8` (Q-in-Q)
+
+Implementation requirement:
+
+* Walk VLAN headers
+* Preserve VLAN ID (for TX)
+* Adjust L3 offset correctly
+
+You do **not** need:
+
+* VLAN filtering
+* VLAN trunk logic
+* VLAN creation/destruction rules
+
+Just **strip and remember**.
+
+---
+
+### c) Length & sanity checks
+
+At L2 you must verify:
+
+* Frame length ≥ Ethernet + IP header
+* No buffer overruns
+* No truncated packets
+
+This is both correctness *and* security.
+
+---
+
+## 2️⃣ Mandatory L2 control-plane handling (ARP / NDP)
+
+This is the most commonly underestimated part.
+
+### Why this is unavoidable
+
+Since you bypass the kernel:
+
+* Kernel ARP table is **not used**
+* Kernel neighbor discovery is **not used**
+* Kernel will **not answer ARP/NDP for you**
+
+So **your app must**.
+
+---
+
+### a) IPv4 → ARP (required)
+
+You must implement:
+
+* ARP request parsing
+* ARP reply generation
+* Minimal ARP cache:
+
+  * `{IP → MAC}`
+  * Timeout-based aging
+
+You do **not** need:
+
+* Gratuitous ARP
+* Proxy ARP
+* ARP announcements
+
+But you **must**:
+
+* Respond to ARP requests for *your local IP*
+* Resolve peer MACs before TX
+
+Without this, TX will fail.
+
+---
+
+### b) IPv6 → Neighbor Discovery (required if IPv6)
+
+Equivalent to ARP, but more complex.
+
+Minimum required:
+
+* ICMPv6 Neighbor Solicitation handling
+* Neighbor Advertisement replies
+* NDP cache
+
+If you want to simplify:
+
+* **Disable IPv6 initially**
+* Start with IPv4-only SCTP
+
+That’s a very common design choice.
+
+---
+
+## 3️⃣ Mandatory L2 TX processing
+
+When sending SCTP packets, you must construct:
+
+```
+[ Ethernet ][ (VLAN) ][ IP ][ SCTP ][ chunks ]
+```
+
+### Required TX logic:
+
+1. Lookup destination MAC:
+
+   * From ARP/NDP cache
+   * Or trigger resolution
+2. Fill Ethernet header:
+
+   * dst MAC
+   * src MAC (NIC’s)
+   * EtherType
+3. Reinsert VLAN tag if RX was VLAN-tagged
+4. Push frame into AF_XDP TX ring
+
+You do **not** use:
+
+* qdisc
+* netfilter
+* routing tables
+
+Routing decision is trivial:
+
+* “Send out the same interface this AF_XDP socket is bound to”
+
+---
+
+## 4️⃣ What you explicitly **do NOT** implement
+
+This is just as important.
+
+You **do not** implement:
+
+❌ Bridging
+❌ Switching
+❌ STP / LLDP / LACP
+❌ Ethernet multicast logic
+❌ Promiscuous mode handling
+❌ Flow control (PAUSE frames)
+❌ GRO / GSO
+❌ Fragmentation at L2
+
+Your XDP program already ensures:
+
+* Only relevant frames reach you
+* Everything else stays in kernel
+
+---
+
+## 5️⃣ What belongs in XDP vs userspace (clean split)
+
+### XDP should do:
+
+* Fast protocol filter (IPv4/IPv6/SCTP/ARP)
+* Queue selection
+* Redirect to correct AF_XDP socket
+* Drop junk early
+
+### Userspace should do:
+
+* Ethernet parsing
+* VLAN stripping
+* ARP/NDP
+* SCTP logic
+* Frame construction
+
+Never mix these responsibilities.
+
+---
+
+## 6️⃣ Minimal L2 feature checklist (this is the real answer)
+
+For **userspace SCTP + AF_XDP**, your L2 layer must implement:
+
+✅ Ethernet header parsing
+✅ VLAN stripping + reinsertion
+✅ ARP (IPv4)
+✅ NDP (IPv6, optional but recommended)
+✅ MAC address cache
+✅ Frame assembly on TX
+✅ Strict validation & dropping
+
+Nothing more.
+
+---
+
+## 7️⃣ One-line architectural truth (use this confidently)
+
+> **When using AF_XDP exclusively, your application must implement a minimal Ethernet termination layer: frame parsing, VLAN handling, and neighbor resolution — but not a full Ethernet stack.**
+
+That is the *correct*, production-grade framing.
+
+---
+
+### If you want next
+
+I can:
+
+* give you a **minimal L2 state machine**
+* sketch a **clean ARP/NDP implementation**
+* show a **DPDK-like L2 shim but much smaller**
+* help you decide **what to push into XDP vs userspace**
+
+You’re now squarely in *network stack architect* territory — this is exactly the right depth of thinking.
